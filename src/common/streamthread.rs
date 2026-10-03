@@ -18,7 +18,7 @@ use tokio::{
         watch::{channel as watch, Receiver as WatchReceiver, Sender as WatchSender},
     },
     task::JoinHandle,
-    time::{sleep, timeout, Duration},
+    time::{sleep, timeout, Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -414,14 +414,14 @@ impl StreamData {
         let mut permit = instance.permit().await?;
 
         // Rather than extract the time stamp from the frame data we
-        // create a new one from the fps
-        // this makes it easier to play the frames at a constant rate
-        // even across reconnects (since reconnects restart the ts otherwise)
+        // stamp each frame with its arrival time.
+        // This keeps the stream in step with real time even when the camera sends
+        // more frames than its reported fps, or its clock runs fast; stamping
+        // from the fps made the stream fall further and further behind.
+        // It also stays monotonic across reconnects (which restart the camera's ts).
         // These are arc mutex to allow tthem to maintain their value across reconnects (else we get an implicit copy)
         let master_ts = Arc::new(tokio::sync::RwLock::new(Duration::ZERO));
-        let fps_delta = Arc::new(tokio::sync::RwLock::new(Duration::from_millis(
-            1000 / (config.borrow().fps as u64),
-        )));
+        let epoch = Instant::now();
 
         me.handle = Some(tokio::task::spawn(async move {
             let r = tokio::select! {
@@ -483,7 +483,6 @@ impl StreamData {
                                     let watchdog_tx = watchdog_tx.clone();
                                     let fps_table = fps_table.clone();
                                     let master_ts = master_ts.clone();
-                                    let fps_delta = fps_delta.clone();
 
                                     Box::pin(async move {
                                         log::trace!("Starting streamthread TASK");
@@ -512,9 +511,6 @@ impl StreamData {
                                                                 false
                                                             }
                                                         });
-                                                        // seperate the borrow so we don't hold it over an await
-                                                        let new_delta = Duration::from_millis(1000 / (stream_config.borrow().fps as u64));
-                                                        *fps_delta.write().await = new_delta;
                                                     },
                                                     BcMedia::InfoV2(info) => {
                                                         stream_config.send_if_modified(|state| {
@@ -528,9 +524,6 @@ impl StreamData {
                                                                 false
                                                             }
                                                         });
-                                                        // seperate the borrow so we don't hold it over an await
-                                                        let new_delta = Duration::from_millis(1000 / (stream_config.borrow().fps as u64));
-                                                        *fps_delta.write().await = new_delta;
                                                     },
                                                     BcMedia::Iframe(frame) => {
                                                         stream_config.send_if_modified(|state| {
@@ -590,7 +583,7 @@ impl StreamData {
                                                         let d = StampedData{
                                                                 keyframe: true,
                                                                 data: Arc::new(data),
-                                                                ts: *master_ts.read().await,
+                                                                ts: arrival_ts(&master_ts, epoch).await,
                                                         };
                                                         let _ = vid_tx.send(d.clone());
                                                         vid_history.send_modify(|history| {
@@ -607,13 +600,12 @@ impl StreamData {
                                                         recieved_iframe = true;
                                                         aud_keyframe = true;
                                                         log::trace!("Sent Vid Key Frame: {:?}", master_ts.read().await);
-                                                        *master_ts.write().await += *fps_delta.read().await;
                                                     },
                                                     BcMedia::Pframe(BcMediaPframe{data, ..}) if recieved_iframe => {
                                                         let d = StampedData{
                                                             keyframe: false,
                                                             data: Arc::new(data),
-                                                            ts: *master_ts.read().await,
+                                                            ts: arrival_ts(&master_ts, epoch).await,
                                                         };
                                                         let _ = vid_tx.send(d.clone());
                                                         vid_history.send_modify(|history| {
@@ -624,11 +616,10 @@ impl StreamData {
                                                                history.pop_front();
                                                            }
                                                         });
-                                                        *master_ts.write().await += *fps_delta.read().await;
                                                         log::trace!("Sent Vid Frame: {:?}", master_ts.read().await);
                                                     }
                                                     BcMedia::Aac(BcMediaAac{data, ..}) | BcMedia::Adpcm(BcMediaAdpcm{data,..}) if recieved_iframe => {
-                                                        let m_ts =  *master_ts.read().await;
+                                                        let m_ts = arrival_ts(&master_ts, epoch).await;
                                                         let d = StampedData{
                                                             keyframe: aud_keyframe,
                                                             data: Arc::new(data),
@@ -706,4 +697,11 @@ impl Drop for StreamData {
             });
         }
     }
+}
+
+/// Time since `epoch` as the stamp for a frame that just arrived, kept strictly increasing
+async fn arrival_ts(master_ts: &tokio::sync::RwLock<Duration>, epoch: Instant) -> Duration {
+    let mut ts = master_ts.write().await;
+    *ts = std::cmp::max(epoch.elapsed(), *ts + Duration::from_micros(1));
+    *ts
 }

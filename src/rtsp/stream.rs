@@ -418,8 +418,6 @@ async fn stream_run(
         let thread_format = stream_config.vid_format;
         let (ts_tx, ts_rx) = tokio::sync::watch::channel(Duration::ZERO);
         // let fallback_time = Duration::from_secs(3);
-        let framerate =
-            Duration::from_millis(1000u64 / std::cmp::max(stream_config.fps as u64, 5u64));
         if let Some(thread_vid) = thread_vid {
             set.spawn(async move {
                 thread_client_count.activate().await?;
@@ -437,7 +435,7 @@ async fn stream_run(
                                         ),
                                         ts_tx,
                                     ),
-                                    framerate
+                                    MAX_FRAME_WAIT
                                 ),
                             //     thread_format,
                             //     framerate,
@@ -459,8 +457,6 @@ async fn stream_run(
         let thread_stream_cancel = stream_cancel.clone();
         let aud_data_rx = BroadcastStream::new(aud_data_rx).filter(|f| f.is_ok()); // Filter to ignore lagged
         let thread_aud = aud.clone();
-        let aud_framerate =
-            Duration::from_millis(1000u64 / std::cmp::max(stream_config.fps as u64, 5u64));
         if let Some(thread_aud) = thread_aud {
             set.spawn(async move {
                 let r = tokio::select! {
@@ -475,7 +471,7 @@ async fn stream_run(
                                 ),
                                 ts_rx,
                             ),
-                            aud_framerate),
+                            MAX_FRAME_WAIT),
                         &thread_aud) => {
                         v
                     },
@@ -494,6 +490,9 @@ async fn stream_run(
     log::trace!("Stream done");
     AnyResult::Ok(())
 }
+
+/// Longest a frame is held back by [`frametime_stream`]
+const MAX_FRAME_WAIT: Duration = Duration::from_secs(1);
 
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
@@ -613,20 +612,35 @@ fn ensure_order<E, T: Stream<Item = Result<StampedData, E>> + Unpin>(
 
 // Take a stream of stamped data pause until
 // it is time to display it
+//
+// Frames are released on a schedule anchored at the first frame: a frame
+// waits until its ts has passed since then, and is released at once when it
+// is already due. A fixed sleep per frame (as before) never catches up, so any
+// delay (processing time, frames arriving faster than expected) piled up.
 fn frametime_stream<E, T: Stream<Item = Result<StampedData, E>> + Unpin>(
     mut stream: T,
-    expected_frame_rate: Duration,
+    max_wait: Duration,
 ) -> impl Stream<Item = AnyResult<StampedData>> + Unpin {
     Box::pin(async_stream::stream! {
-        let mut ts_before = Duration::MAX;
+        let mut anchor: Option<(tokio::time::Instant, Duration)> = None;
         while let Some(frame) = stream.next().await {
             if let Ok(frame) = frame {
-                if frame.ts < ts_before {
-                    ts_before = frame.ts;
+                let now = tokio::time::Instant::now();
+                let (start, ts_0) = match anchor {
+                    Some((start, ts_0)) if frame.ts >= ts_0 => (start, ts_0),
+                    _ => {
+                        // First frame, or the ts went backwards: start a new schedule
+                        anchor = Some((now, frame.ts));
+                        (now, frame.ts)
+                    }
+                };
+                let due = start + (frame.ts - ts_0);
+                if due > now + max_wait {
+                    // ts jumped ahead (e.g. a long gap): start a new schedule here
+                    anchor = Some((now, frame.ts));
+                } else if due > now {
+                    tokio::time::sleep_until(due).await;
                 }
-                let wait = std::cmp::min(frame.ts.saturating_sub(ts_before), expected_frame_rate);
-                tokio::time::sleep(wait).await;
-                ts_before = frame.ts;
                 yield Ok(frame);
             }
         }
