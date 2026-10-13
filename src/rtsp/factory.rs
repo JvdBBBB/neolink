@@ -1,6 +1,5 @@
 use gstreamer::ClockTime;
 use std::{
-    collections::HashMap,
     time::{Duration, Instant},
 };
 
@@ -248,13 +247,11 @@ pub(super) async fn make_factory(
                         std::thread::spawn(move || {
                             let mut aud_ts = Duration::ZERO;
                             let mut vid_ts = Duration::ZERO;
-                            let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
                                 send_to_sources(
                                     buffered,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -273,7 +270,6 @@ pub(super) async fn make_factory(
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
                                     data,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -323,7 +319,6 @@ const MAX_AUDIO_DRIFT: Duration = Duration::from_millis(200);
 #[allow(clippy::too_many_arguments)]
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     vid_ts: &mut Duration,
@@ -352,7 +347,7 @@ fn send_to_sources(
             let ts = audio_ts(aud_ts);
             if let Some(aud_src) = aud_src.as_ref() {
                 log::debug!("Sending AAC: {:?}", ts);
-                send_to_appsrc(aud_src, aac.data, ts, pools)?;
+                send_to_appsrc(aud_src, aac.data, ts)?;
             }
             *aud_ts = ts + Duration::from_micros(duration as u64);
         }
@@ -363,7 +358,7 @@ fn send_to_sources(
             let ts = audio_ts(aud_ts);
             if let Some(aud_src) = aud_src.as_ref() {
                 log::trace!("Sending ADPCM: {:?}", ts);
-                send_to_appsrc(aud_src, adpcm.data, ts, pools)?;
+                send_to_appsrc(aud_src, adpcm.data, ts)?;
             }
             *aud_ts = ts + Duration::from_micros(duration as u64);
         }
@@ -376,7 +371,7 @@ fn send_to_sources(
             };
             if let Some(vid_src) = vid_src.as_ref() {
                 log::trace!("Sending VID: {:?}", ts);
-                send_to_appsrc(vid_src, data, ts, pools)?;
+                send_to_appsrc(vid_src, data, ts)?;
             }
             *vid_ts = match live_start {
                 Some(_) => ts + Duration::from_micros(1),
@@ -392,7 +387,6 @@ fn send_to_appsrc(
     appsrc: &AppSrc,
     data: Vec<u8>,
     mut ts: Duration,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
 ) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
@@ -416,34 +410,15 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
+    // Wrap the frame data in a buffer without copying. A pool per frame size kept
+    // every pool (8 preallocated buffers each) alive for the whole session, so memory
+    // grew with every new frame size (see upstream #340)
     let buf = {
-        let msg_size = data.len();
-
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
-
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
-            gst_buf_mut.set_dts(time);
-            gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
+        let mut gst_buf = gstreamer::Buffer::from_mut_slice(data);
+        let gst_buf_mut = gst_buf.get_mut().unwrap();
+        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        gst_buf_mut.set_dts(time);
+        gst_buf_mut.set_pts(time);
         gst_buf
     };
 
